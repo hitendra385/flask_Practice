@@ -1,0 +1,236 @@
+name: Test, Build, and Deploy to EC2
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+  EC2_APP_PORT: ${{ vars.EC2_APP_PORT || '5000' }}
+
+jobs:
+  test:
+    name: Install and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Run tests
+        run: python -m pytest -q
+
+  build_push:
+    name: Build and push image
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image_uri: ${{ steps.build_image.outputs.uri }}
+      failure_stage: ${{ steps.failure_stage.outputs.stage }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials with OIDC
+        id: aws_credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build image tagged with commit SHA
+        id: build_image
+        run: |
+          test -n "$ECR_REPOSITORY" || { echo "ECR_REPOSITORY variable is required"; exit 1; }
+          account_id=$(aws sts get-caller-identity --query Account --output text)
+          registry="${account_id}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          image_uri="${registry}/${ECR_REPOSITORY}:${GITHUB_SHA}"
+          echo "uri=${image_uri}" >> "$GITHUB_OUTPUT"
+          docker build --tag "$image_uri" .
+
+      - name: Authenticate to ECR
+        id: ecr_login
+        if: success()
+        run: |
+          account_id=$(aws sts get-caller-identity --query Account --output text)
+          registry="${account_id}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$registry"
+
+      - name: Push image to ECR
+        id: push_image
+        if: success()
+        env:
+          IMAGE_URI: ${{ steps.build_image.outputs.uri }}
+        run: docker push "$IMAGE_URI"
+
+      - name: Capture failed stage
+        id: failure_stage
+        if: failure()
+        run: |
+          if [[ "${{ steps.build_image.outcome }}" == "failure" ]]; then
+            echo "stage=build" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ steps.aws_credentials.outcome }}" == "failure" || "${{ steps.ecr_login.outcome }}" == "failure" || "${{ steps.push_image.outcome }}" == "failure" ]]; then
+            echo "stage=push" >> "$GITHUB_OUTPUT"
+          else
+            echo "stage=build" >> "$GITHUB_OUTPUT"
+          fi
+
+  deploy:
+    name: Deploy and verify on EC2
+    needs: build_push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure SSH credentials
+        env:
+          EC2_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          EC2_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+        run: |
+          test -n "$EC2_SSH_PRIVATE_KEY" || { echo "EC2_SSH_PRIVATE_KEY secret is required"; exit 1; }
+          test -n "$EC2_KNOWN_HOSTS" || { echo "EC2_KNOWN_HOSTS secret is required"; exit 1; }
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$EC2_SSH_PRIVATE_KEY" > "$HOME/.ssh/deploy_key"
+          chmod 600 "$HOME/.ssh/deploy_key"
+          printf '%s\n' "$EC2_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Replace container and verify health
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_SSH_USER: ${{ vars.EC2_SSH_USER }}
+          IMAGE_URI: ${{ needs.build_push.outputs.image_uri }}
+        run: |
+          test -n "$EC2_HOST" || { echo "EC2_HOST secret is required"; exit 1; }
+          test -n "$EC2_SSH_USER" || { echo "EC2_SSH_USER variable is required"; exit 1; }
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/deploy_key" "$EC2_SSH_USER@$EC2_HOST" \
+            bash -s -- "$IMAGE_URI" "$AWS_REGION" "$EC2_APP_PORT" <<'REMOTE'
+          set -Eeuo pipefail
+          image_uri="$1"
+          aws_region="$2"
+          app_port="$3"
+          container_name="flask-practice"
+
+          if [[ ! "$app_port" =~ ^[0-9]+$ ]]; then
+            echo "EC2_APP_PORT must be a numeric port" >&2
+            exit 1
+          fi
+          registry="${image_uri%%/*}"
+          aws ecr get-login-password --region "$aws_region" \
+            | docker login --username AWS --password-stdin "$registry"
+          docker pull "$image_uri"
+          docker stop "$container_name" || true
+          docker rm "$container_name" || true
+          docker run -d --restart unless-stopped --name "$container_name" \
+            -p "${app_port}:5000" "$image_uri"
+
+          healthy=0
+          for attempt in {1..30}; do
+            if curl --fail --silent "http://127.0.0.1:${app_port}/health"; then
+              healthy=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [[ "$healthy" -ne 1 ]]; then
+            docker logs "$container_name" >&2 || true
+            echo "Deployment health check failed" >&2
+            exit 1
+          fi
+          REMOTE
+
+  notify:
+    name: Email pipeline result
+    if: ${{ always() }}
+    needs:
+      - test
+      - build_push
+      - deploy
+    runs-on: ubuntu-latest
+    env:
+      TEST_RESULT: ${{ needs.test.result }}
+      BUILD_RESULT: ${{ needs.build_push.result }}
+      BUILD_FAILURE_STAGE: ${{ needs.build_push.outputs.failure_stage }}
+      DEPLOY_RESULT: ${{ needs.deploy.result }}
+      COMMIT_SHA: ${{ github.sha }}
+      BRANCH_NAME: ${{ github.ref_name }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      IMAGE_TAG: ${{ github.sha }}
+      EC2_TARGET: ${{ secrets.EC2_HOST }}
+      SMTP_HOST: smtp.gmail.com
+      SMTP_PORT: '587'
+      SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+      EMAIL_FROM: ${{ vars.EMAIL_FROM }}
+      EMAIL_TO: ${{ vars.EMAIL_TO }}
+    steps:
+      - name: Send customized success or failure email
+        run: |
+          python - <<'PY'
+          import os
+          import smtplib
+          import ssl
+          from email.message import EmailMessage
+
+          stages = (
+              ("test", os.environ["TEST_RESULT"]),
+              (os.environ.get("BUILD_FAILURE_STAGE") or "build/push", os.environ["BUILD_RESULT"]),
+              ("deploy", os.environ["DEPLOY_RESULT"]),
+          )
+          failed_stage = next(
+              (name for name, result in stages if result not in ("success", "skipped")),
+              None,
+          )
+          commit = os.environ["COMMIT_SHA"]
+          branch = os.environ["BRANCH_NAME"]
+          run_url = os.environ["RUN_URL"]
+          image_tag = os.environ["IMAGE_TAG"]
+
+          message = EmailMessage()
+          if failed_stage is None:
+              message["Subject"] = f"[SUCCESS] Flask deployment {commit[:7]}"
+              message.set_content(
+                  "Deployment succeeded.\n\n"
+                  f"Commit: {commit}\n"
+                  f"Branch: {branch}\n"
+                  f"ECR image tag: {image_tag}\n"
+                  f"EC2 target: {os.environ.get('EC2_TARGET') or 'not configured'}\n"
+                  f"Pipeline run: {run_url}\n"
+              )
+          else:
+              if failed_stage == "build/push":
+                  failed_stage = os.environ.get("BUILD_FAILURE_STAGE") or failed_stage
+              message["Subject"] = f"[FAILURE] Flask pipeline failed at {failed_stage}"
+              message.set_content(
+                  "The Flask deployment did not complete.\n\n"
+                  f"Failed stage: {failed_stage}\n"
+                  f"Commit: {commit}\n"
+                  f"Branch: {branch}\n"
+                  f"Pipeline run and logs: {run_url}\n"
+              )
+
+          message["From"] = os.environ["EMAIL_FROM"]
+          message["To"] = os.environ["EMAIL_TO"]
+          context = ssl.create_default_context()
+          with smtplib.SMTP(os.environ["SMTP_HOST"], int(os.environ["SMTP_PORT"]), timeout=30) as smtp:
+              smtp.starttls(context=context)
+              smtp.login(os.environ["SMTP_USERNAME"], os.environ["SMTP_PASSWORD"])
+              smtp.send_message(message)
+          PY

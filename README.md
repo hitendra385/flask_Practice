@@ -1,126 +1,96 @@
-# Student Registration System
+# Flask CI/CD Demo
 
-A simple **Flask** web application to manage student records with **MongoDB** as the backend database. Users can **add, view, update, and delete** student details.
+A small Flask service for the CI/CD assignment. It provides a home endpoint and `/health` status endpoint and has no database or external runtime services.
 
----
-
-## Features
-
-* List all students on the home page
-* Add a new student
-* Update existing student details
-* Delete a student with confirmation
-* Simple and responsive UI using Bootstrap
-
----
-
-## Tech Stack
-
-* **Backend:** Python, Flask
-* **Database:** MongoDB (via Flask-PyMongo)
-* **Frontend:** HTML, Jinja2 templates, Bootstrap 5
-* **Environment Variables:** Managed via `.env` file
-
----
-
-## Setup Instructions
-
-### 1. Clone the repository
+## Run locally
 
 ```bash
-git clone <your-repo-url>
-cd <repo-folder>
-```
-
-### 2. Create and activate a virtual environment
-
-```bash
-python -m venv venv
-# Activate venv
-# Windows:
-venv\Scripts\activate
-# Linux / Mac:
-source venv/bin/activate
-```
-
-### 3. Install dependencies
-
-```bash
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-```
-
-**`requirements.txt` example:**
-
-```
-Flask
-Flask-PyMongo
-python-dotenv
-bson
-```
-
-### 4. Configure environment variables
-
-Create a `.env` file in the project root:
-
-```
-MONGO_URI=<your-mongodb-connection-string>
-SECRET_KEY=<your-secret-key>
-```
-
-### 5. Run the application
-
-```bash
 python app.py
 ```
 
-Open your browser at: [http://localhost:8000](http://localhost:8000)
+The service listens on port 5000. Check `http://localhost:5000/health` for `{"status":"ok"}`.
 
----
+Run tests with:
 
-## Project Structure
-
-```
-project/
-│
-├── templates/
-│   ├── base.html
-│   ├── index.html
-│   ├── add_student.html
-│   ├── update_student.html
-│
-├── app.py
-├── requirements.txt
-└── .env
+```bash
+pytest -q
 ```
 
----
+## CI/CD Deployment to AWS
 
-## Screenshots
+The GitHub Actions workflow at `.github/workflows/deploy-ec2.yml` runs on every push to `main`. It runs pytest before building an image, pushing the commit-SHA-tagged image to ECR, and deploying it to EC2 over SSH. The deployment succeeds only after `GET /health` confirms the Flask container is responding.
 
-**Home Page**
-Lists all students with Edit/Delete buttons.
-- <img width="1902" height="607" alt="image" src="https://github.com/user-attachments/assets/a58a6a6d-4978-4769-8074-232e4d31e69d" />
+### AWS prerequisites
 
+Create an ECR repository and an Amazon Linux 2023 or Ubuntu EC2 instance. Install and enable Docker and the AWS CLI on the instance. Attach an instance profile with `AmazonEC2ContainerRegistryReadOnly` (or equivalent scoped permissions) so the instance can authenticate to ECR without AWS keys on the machine. The instance security group must allow inbound application traffic on port 5000. For this SSH workflow, allow port 22 only from the CI runner's egress IP range; GitHub-hosted runner IPs can change, so a self-hosted runner with a fixed egress IP is preferable to opening SSH broadly.
 
-**Add Student**
-Form to add a new student.
-- <img width="1897" height="801" alt="image" src="https://github.com/user-attachments/assets/d65d25c3-ebb5-410a-adb1-e130ad7c5878" />
+Ensure the deployment user can run Docker and AWS CLI commands. The container listens on port 5000. Set `EC2_APP_PORT` to change the host port if required.
 
+### GitHub Actions configuration
 
-**Update Student**
-Form pre-filled with student details.
-- <img width="1905" height="897" alt="image" src="https://github.com/user-attachments/assets/04febf01-879f-431f-ab07-abcfb993acf1" />
+Configure these repository variables under **Settings > Secrets and variables > Actions > Variables**:
 
+| Variable | Description |
+| --- | --- |
+| `AWS_REGION` | AWS region containing ECR and EC2 |
+| `ECR_REPOSITORY` | ECR repository name (not the full image URI) |
+| `EC2_SSH_USER` | Linux user used to connect to EC2 |
+| `EC2_APP_PORT` | Optional host port; defaults to `5000` |
+| `EMAIL_FROM` | Sender email address |
+| `EMAIL_TO` | Recipient email address |
 
+Configure these repository secrets under **Settings > Secrets and variables > Actions > Secrets**:
 
----
+| Secret | Description |
+| --- | --- |
+| `AWS_ROLE_TO_ASSUME` | IAM role ARN for GitHub OIDC; grant ECR push permissions scoped to the repository and `ecr:GetAuthorizationToken` |
+| `EC2_HOST` | EC2 public DNS name or address reachable by the runner |
+| `EC2_SSH_PRIVATE_KEY` | Private key for the deployment user's authorized key |
+| `EC2_KNOWN_HOSTS` | Pinned `known_hosts` entry for the EC2 host; do not disable host-key checking |
+| `SMTP_USERNAME` | SMTP account username |
+| `SMTP_PASSWORD` | SMTP account password or app password |
 
-## Notes
+The workflow uses Gmail SMTP over STARTTLS (`smtp.gmail.com:587`). Keep the SMTP username and app password in GitHub Secrets; sender and recipient addresses are repository Variables.
 
-* Make sure MongoDB is running and accessible via the URI in `.env`
-* Delete action includes a confirmation page to prevent accidental deletion
-* Uses `ObjectId` from `bson` to work with MongoDB document IDs
-* If you use MongoDB Atlas on macOS, install dependencies again (`pip install -r requirements.txt`). This project now uses `certifi` CA bundle explicitly to avoid common TLS certificate verification failures with `pymongo`.
+Configure the AWS IAM OIDC provider for `token.actions.githubusercontent.com`. Restrict the role trust policy to this GitHub repository and the `main` branch. The role needs `ecr:GetAuthorizationToken` on `*` and ECR upload/image permissions (`BatchCheckLayerAvailability`, `CompleteLayerUpload`, `InitiateLayerUpload`, `PutImage`, and `UploadLayerPart`) on the target repository. The EC2 instance role separately needs pull-only ECR access.
+
+SSH was chosen because it can run commands directly on an existing EC2 host without setting up Systems Manager managed-instance access. The workflow uses SSH to start deployment commands on EC2; the instance role then logs into ECR and pulls the image. AWS credentials are not stored in GitHub secrets or copied to EC2. Email credentials, the SSH key, host, and assumed role ARN are stored as GitHub secrets. Systems Manager Session Manager is a stronger alternative when you want to avoid inbound SSH access.
+
+### Manual deployment
+
+From a machine with Docker and AWS CLI configured for the target account, build and push an image tagged with the source commit:
+
+```bash
+export AWS_REGION=<aws-region>
+export ECR_REPOSITORY=<ecr-repository>
+export AWS_ACCOUNT_ID=<aws-account-id>
+export IMAGE_TAG=$(git rev-parse HEAD)
+export IMAGE_URI="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$IMAGE_TAG"
+
+aws ecr get-login-password --region "$AWS_REGION" \
+	| docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+docker build --tag "$IMAGE_URI" .
+docker push "$IMAGE_URI"
+```
+
+Then connect to EC2 using the deployment SSH key and run:
+
+```bash
+aws ecr get-login-password --region <aws-region> \
+	| docker login --username AWS --password-stdin <account-id>.dkr.ecr.<aws-region>.amazonaws.com
+docker pull <account-id>.dkr.ecr.<aws-region>.amazonaws.com/<repository>:<commit-sha>
+docker stop flask-practice || true
+docker rm flask-practice || true
+docker run -d --restart unless-stopped --name flask-practice \
+	-p 5000:5000 \
+	<account-id>.dkr.ecr.<aws-region>.amazonaws.com/<repository>:<commit-sha>
+curl --fail http://127.0.0.1:5000/health
+```
+
+The image tag should be the commit SHA being deployed. A non-zero `curl` result means deployment verification failed; inspect the container with `docker logs flask-practice`.
 
 ---
 
