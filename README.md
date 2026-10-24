@@ -61,36 +61,63 @@ SSH was chosen because it can run commands directly on an existing EC2 host with
 
 ### Manual deployment
 
-From a machine with Docker and AWS CLI configured for the target account, build and push an image tagged with the source commit:
+From a machine with Docker and AWS CLI configured for the target account, verify the active AWS identity and ensure the checked-out source is the commit you intend to deploy. Build and push an image tagged with that commit:
 
 ```bash
 export AWS_REGION=<aws-region>
 export ECR_REPOSITORY=<ecr-repository>
-export AWS_ACCOUNT_ID=<aws-account-id>
+export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 export IMAGE_TAG=$(git rev-parse HEAD)
 export IMAGE_URI="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$IMAGE_TAG"
 
 aws ecr get-login-password --region "$AWS_REGION" \
-	| docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+  | docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
 docker build --tag "$IMAGE_URI" .
 docker push "$IMAGE_URI"
 ```
 
-Then connect to EC2 using the deployment SSH key and run:
+The EC2 instance must have Docker and AWS CLI installed, an instance profile with ECR pull permissions, and a security group that allows SSH from your deployment machine and inbound traffic on the application port. The public key corresponding to your private key must be in the deployment user's `~/.ssh/authorized_keys`. Add the verified EC2 host key to your local `~/.ssh/known_hosts`; keep strict host-key checking enabled.
+
+Set the connection values and run the deployment script below. Use `ec2-user` for Amazon Linux or `ubuntu` for Ubuntu. Set `EC2_APP_PORT` if you use a host port other than `5000`.
 
 ```bash
-aws ecr get-login-password --region <aws-region> \
-	| docker login --username AWS --password-stdin <account-id>.dkr.ecr.<aws-region>.amazonaws.com
-docker pull <account-id>.dkr.ecr.<aws-region>.amazonaws.com/<repository>:<commit-sha>
-docker stop flask-practice || true
-docker rm flask-practice || true
-docker run -d --restart unless-stopped --name flask-practice \
-	-p 5000:5000 \
-	<account-id>.dkr.ecr.<aws-region>.amazonaws.com/<repository>:<commit-sha>
-curl --fail http://127.0.0.1:5000/health
+export EC2_HOST="<ec2-public-dns-or-ip>"
+export EC2_SSH_USER="ec2-user"
+export EC2_SSH_PRIVATE_KEY_PATH="$HOME/.ssh/flask-ec2.pem"
+export EC2_APP_PORT="5000"
+
+ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+-i "$EC2_SSH_PRIVATE_KEY_PATH" "$EC2_SSH_USER@$EC2_HOST" \
+bash -s -- "$IMAGE_URI" "$AWS_REGION" "$EC2_APP_PORT" <<'REMOTE'
+set -Eeuo pipefail
+image_uri="$1"
+aws_region="$2"
+app_port="$3"
+container_name="flask-practice"
+registry="${image_uri%%/*}"
+
+aws ecr get-login-password --region "$aws_region" \
+| docker login --username AWS --password-stdin "$registry"
+docker pull "$image_uri"
+docker stop "$container_name" || true
+docker rm "$container_name" || true
+docker run -d --restart unless-stopped --name "$container_name" \
+-p "${app_port}:5000" "$image_uri"
+
+for attempt in {1..30}; do
+if curl --fail --silent "http://127.0.0.1:${app_port}/health"; then
+  exit 0
+fi
+sleep 2
+done
+
+docker logs "$container_name" >&2 || true
+echo "Deployment health check failed" >&2
+exit 1
+REMOTE
 ```
 
-The image tag should be the commit SHA being deployed. A non-zero `curl` result means deployment verification failed; inspect the container with `docker logs flask-practice`.
+The image tag should be the commit SHA being deployed. A non-zero SSH command result means the deployment or health check failed; inspect the container on EC2 with `docker logs flask-practice`.
 
 ---
 
@@ -99,6 +126,3 @@ The image tag should be the commit SHA being deployed. A non-zero `curl` result 
 MIT License
 
 ---
-
-
-
